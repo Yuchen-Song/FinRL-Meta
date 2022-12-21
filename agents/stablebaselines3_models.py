@@ -1,4 +1,6 @@
-# common library
+# DRL models from Stable Baselines 3
+from __future__ import annotations
+
 import time
 
 import numpy as np
@@ -13,11 +15,9 @@ from stable_baselines3.common.noise import NormalActionNoise
 from stable_baselines3.common.noise import OrnsteinUhlenbeckActionNoise
 from stable_baselines3.common.vec_env import DummyVecEnv
 
-from meta import config
-from meta.env_stock_trading.env_stock_trading import StockTradingEnv
-
-# RL models from stable-baselines
-
+from finrl import config
+from finrl.meta.env_stock_trading.env_stocktrading import StockTradingEnv
+from finrl.meta.preprocessor.preprocessors import data_split
 
 MODELS = {"a2c": A2C, "ddpg": DDPG, "td3": TD3, "sac": SAC, "ppo": PPO}
 
@@ -35,7 +35,7 @@ class TensorboardCallback(BaseCallback):
     """
 
     def __init__(self, verbose=0):
-        super(TensorboardCallback, self).__init__(verbose)
+        super().__init__(verbose)
 
     def _on_step(self) -> bool:
         try:
@@ -75,6 +75,7 @@ class DRLAgent:
         model_kwargs=None,
         verbose=1,
         seed=None,
+        tensorboard_log=None,
     ):
         if model_name not in MODELS:
             raise NotImplementedError("NotImplementedError")
@@ -88,16 +89,15 @@ class DRLAgent:
                 mean=np.zeros(n_actions), sigma=0.1 * np.ones(n_actions)
             )
         print(model_kwargs)
-        model = MODELS[model_name](
+        return MODELS[model_name](
             policy=policy,
             env=self.env,
-            tensorboard_log=f"{config.TENSORBOARD_LOG_DIR}/{model_name}",
+            tensorboard_log=tensorboard_log,
             verbose=verbose,
             policy_kwargs=policy_kwargs,
             seed=seed,
             **model_kwargs,
         )
-        return model
 
     def train_model(self, model, tb_log_name, total_timesteps=5000):
         model = model.learn(
@@ -108,27 +108,29 @@ class DRLAgent:
         return model
 
     @staticmethod
-    def DRL_prediction(model, environment):
+    def DRL_prediction(model, environment, deterministic=True):
         test_env, test_obs = environment.get_sb_env()
         """make a prediction"""
         account_memory = []
         actions_memory = []
+        #         state_memory=[] #add memory pool to store states
         test_env.reset()
         for i in range(len(environment.df.index.unique())):
-            action, _states = model.predict(test_obs)
+            action, _states = model.predict(test_obs, deterministic=deterministic)
             # account_memory = test_env.env_method(method_name="save_asset_memory")
             # actions_memory = test_env.env_method(method_name="save_action_memory")
             test_obs, rewards, dones, info = test_env.step(action)
             if i == (len(environment.df.index.unique()) - 2):
                 account_memory = test_env.env_method(method_name="save_asset_memory")
                 actions_memory = test_env.env_method(method_name="save_action_memory")
+            #                 state_memory=test_env.env_method(method_name="save_state_memory") # add current state to state memory
             if dones[0]:
                 print("hit end!")
                 break
         return account_memory[0], actions_memory[0]
 
     @staticmethod
-    def DRL_prediction_load_from_file(model_name, environment, cwd):
+    def DRL_prediction_load_from_file(model_name, environment, cwd, deterministic=True):
         if model_name not in MODELS:
             raise NotImplementedError("NotImplementedError")
         try:
@@ -140,17 +142,16 @@ class DRLAgent:
 
         # test on the testing env
         state = environment.reset()
-        episode_returns = list()  # the cumulative_return / initial_account
-        episode_total_assets = list()
-        episode_total_assets.append(environment.initial_total_asset)
+        episode_returns = []  # the cumulative_return / initial_account
+        episode_total_assets = [environment.initial_total_asset]
         done = False
         while not done:
-            action = model.predict(state)[0]
+            action = model.predict(state, deterministic=deterministic)[0]
             state, reward, done, _ = environment.step(action)
 
             total_asset = (
-                environment.cash
-                + (environment.price_array[environment.time] * environment.stocks).sum()
+                environment.amount
+                + (environment.price_ary[environment.day] * environment.stocks).sum()
             )
             episode_total_assets.append(total_asset)
             episode_return = total_asset / environment.initial_total_asset
@@ -187,7 +188,7 @@ class DRLEnsembleAgent:
                 temp_model_kwargs["action_noise"]
             ](mean=np.zeros(n_actions), sigma=0.1 * np.ones(n_actions))
         print(temp_model_kwargs)
-        model = MODELS[model_name](
+        return MODELS[model_name](
             policy=policy,
             env=env,
             tensorboard_log=f"{config.TENSORBOARD_LOG_DIR}/{model_name}",
@@ -196,7 +197,6 @@ class DRLEnsembleAgent:
             seed=seed,
             **temp_model_kwargs,
         )
-        return model
 
     @staticmethod
     def train_model(model, model_name, tb_log_name, iter_num, total_timesteps=5000):
@@ -206,7 +206,7 @@ class DRLEnsembleAgent:
             callback=TensorboardCallback(),
         )
         model.save(
-            f"{config.TRAINED_MODEL_DIR}/{model_name.upper()}_{total_timesteps//1000}k_{iter_num}"
+            f"{config.TRAINED_MODEL_DIR}/{model_name.upper()}_{total_timesteps // 1000}k_{iter_num}"
         )
         return model
 
@@ -214,14 +214,20 @@ class DRLEnsembleAgent:
     def get_validation_sharpe(iteration, model_name):
         """Calculate Sharpe ratio based on validation results"""
         df_total_value = pd.read_csv(
-            "results/account_value_validation_{}_{}.csv".format(model_name, iteration)
+            f"results/account_value_validation_{model_name}_{iteration}.csv"
         )
-        sharpe = (
-            (4**0.5)
-            * df_total_value["daily_return"].mean()
-            / df_total_value["daily_return"].std()
-        )
-        return sharpe
+        # If the agent did not make any transaction
+        if df_total_value["daily_return"].var() == 0:
+            if df_total_value["daily_return"].mean() > 0:
+                return np.inf
+            else:
+                return 0.0
+        else:
+            return (
+                (4**0.5)
+                * df_total_value["daily_return"].mean()
+                / df_total_value["daily_return"].std()
+            )
 
     def __init__(
         self,
@@ -265,7 +271,7 @@ class DRLEnsembleAgent:
 
     def DRL_validation(self, model, test_data, test_env, test_obs):
         """validation process"""
-        for i in range(len(test_data.index.unique())):
+        for _ in range(len(test_data.index.unique())):
             action, _states = model.predict(test_obs)
             test_obs, rewards, dones, info = test_env.step(action)
 
@@ -283,16 +289,17 @@ class DRLEnsembleAgent:
         trade_env = DummyVecEnv(
             [
                 lambda: StockTradingEnv(
-                    trade_data,
-                    self.stock_dim,
-                    self.hmax,
-                    self.initial_amount,
-                    self.buy_cost_pct,
-                    self.sell_cost_pct,
-                    self.reward_scaling,
-                    self.state_space,
-                    self.action_space,
-                    self.tech_indicator_list,
+                    df=trade_data,
+                    stock_dim=self.stock_dim,
+                    hmax=self.hmax,
+                    initial_amount=self.initial_amount,
+                    num_stock_shares=[0] * self.stock_dim,
+                    buy_cost_pct=[self.buy_cost_pct] * self.stock_dim,
+                    sell_cost_pct=[self.sell_cost_pct] * self.stock_dim,
+                    reward_scaling=self.reward_scaling,
+                    state_space=self.state_space,
+                    action_space=self.action_space,
+                    tech_indicator_list=self.tech_indicator_list,
                     turbulence_threshold=turbulence_threshold,
                     initial=initial,
                     previous_state=last_state,
@@ -314,17 +321,11 @@ class DRLEnsembleAgent:
                 last_state = trade_env.render()
 
         df_last_state = pd.DataFrame({"last_state": last_state})
-        df_last_state.to_csv(
-            "results/last_state_{}_{}.csv".format(name, i), index=False
-        )
+        df_last_state.to_csv(f"results/last_state_{name}_{i}.csv", index=False)
         return last_state
 
     def run_ensemble_strategy(
-        self,
-        A2C_model_kwargs,
-        PPO_model_kwargs,
-        DDPG_model_kwargs,
-        timesteps_dict,
+        self, timesteps_dict
     ):
         """Ensemble Strategy that combines PPO, A2C and DDPG"""
         print("============Start Ensemble Strategy============")
@@ -332,8 +333,8 @@ class DRLEnsembleAgent:
         # of the previous model to the current model as the initial state
         last_state_ensemble = []
 
-        ppo_sharpe_list = []
-        ddpg_sharpe_list = []
+        sac_sharpe_list = []
+        td3_sharpe_list = []
         a2c_sharpe_list = []
 
         model_use = []
@@ -427,16 +428,17 @@ class DRLEnsembleAgent:
             self.train_env = DummyVecEnv(
                 [
                     lambda: StockTradingEnv(
-                        train,
-                        self.stock_dim,
-                        self.hmax,
-                        self.initial_amount,
-                        self.buy_cost_pct,
-                        self.sell_cost_pct,
-                        self.reward_scaling,
-                        self.state_space,
-                        self.action_space,
-                        self.tech_indicator_list,
+                        df=train,
+                        stock_dim=self.stock_dim,
+                        hmax=self.hmax,
+                        initial_amount=self.initial_amount,
+                        num_stock_shares=[0] * self.stock_dim,
+                        buy_cost_pct=[self.buy_cost_pct] * self.stock_dim,
+                        sell_cost_pct=[self.sell_cost_pct] * self.stock_dim,
+                        reward_scaling=self.reward_scaling,
+                        state_space=self.state_space,
+                        action_space=self.action_space,
+                        tech_indicator_list=self.tech_indicator_list,
                         print_verbosity=self.print_verbosity,
                     )
                 ]
@@ -464,15 +466,12 @@ class DRLEnsembleAgent:
             # print("==============Model Training===========")
             print("======A2C Training========")
             model_a2c = self.get_model(
-                "a2c",
-                self.train_env,
-                policy="MlpPolicy",
-                model_kwargs=A2C_model_kwargs,
+                "a2c", self.train_env, policy="MlpPolicy"
             )
             model_a2c = self.train_model(
                 model_a2c,
                 "a2c",
-                tb_log_name="a2c_{}".format(i),
+                tb_log_name=f"a2c_{i}",
                 iter_num=i,
                 total_timesteps=timesteps_dict["a2c"],
             )  # 100_000
@@ -486,16 +485,17 @@ class DRLEnsembleAgent:
             val_env_a2c = DummyVecEnv(
                 [
                     lambda: StockTradingEnv(
-                        validation,
-                        self.stock_dim,
-                        self.hmax,
-                        self.initial_amount,
-                        self.buy_cost_pct,
-                        self.sell_cost_pct,
-                        self.reward_scaling,
-                        self.state_space,
-                        self.action_space,
-                        self.tech_indicator_list,
+                        df=validation,
+                        stock_dim=self.stock_dim,
+                        hmax=self.hmax,
+                        initial_amount=self.initial_amount,
+                        num_stock_shares=[0] * self.stock_dim,
+                        buy_cost_pct=[self.buy_cost_pct] * self.stock_dim,
+                        sell_cost_pct=[self.sell_cost_pct] * self.stock_dim,
+                        reward_scaling=self.reward_scaling,
+                        state_space=self.state_space,
+                        action_space=self.action_space,
+                        tech_indicator_list=self.tech_indicator_list,
                         turbulence_threshold=turbulence_threshold,
                         iteration=i,
                         model_name="A2C",
@@ -514,110 +514,108 @@ class DRLEnsembleAgent:
             sharpe_a2c = self.get_validation_sharpe(i, model_name="A2C")
             print("A2C Sharpe Ratio: ", sharpe_a2c)
 
-            print("======PPO Training========")
-            model_ppo = self.get_model(
-                "ppo",
-                self.train_env,
-                policy="MlpPolicy",
-                model_kwargs=PPO_model_kwargs,
+            print("======SAC Training========")
+            model_sac = self.get_model(
+                "sac", self.train_env, policy="MlpPolicy"
             )
-            model_ppo = self.train_model(
-                model_ppo,
-                "ppo",
-                tb_log_name="ppo_{}".format(i),
+            model_sac = self.train_model(
+                model_sac,
+                "sac",
+                tb_log_name=f"sac_{i}",
                 iter_num=i,
-                total_timesteps=timesteps_dict["ppo"],
+                total_timesteps=timesteps_dict["sac"],
             )  # 100_000
             print(
-                "======PPO Validation from: ",
+                "======SAC Validation from: ",
                 validation_start_date,
                 "to ",
                 validation_end_date,
             )
-            val_env_ppo = DummyVecEnv(
+            val_env_sac = DummyVecEnv(
                 [
                     lambda: StockTradingEnv(
-                        validation,
-                        self.stock_dim,
-                        self.hmax,
-                        self.initial_amount,
-                        self.buy_cost_pct,
-                        self.sell_cost_pct,
-                        self.reward_scaling,
-                        self.state_space,
-                        self.action_space,
-                        self.tech_indicator_list,
+                        df=validation,
+                        stock_dim=self.stock_dim,
+                        hmax=self.hmax,
+                        initial_amount=self.initial_amount,
+                        num_stock_shares=[0] * self.stock_dim,
+                        buy_cost_pct=[self.buy_cost_pct] * self.stock_dim,
+                        sell_cost_pct=[self.sell_cost_pct] * self.stock_dim,
+                        reward_scaling=self.reward_scaling,
+                        state_space=self.state_space,
+                        action_space=self.action_space,
+                        tech_indicator_list=self.tech_indicator_list,
                         turbulence_threshold=turbulence_threshold,
                         iteration=i,
-                        model_name="PPO",
+                        model_name="SAC",
                         mode="validation",
                         print_verbosity=self.print_verbosity,
                     )
                 ]
             )
-            val_obs_ppo = val_env_ppo.reset()
+            val_obs_sac = val_env_sac.reset()
             self.DRL_validation(
-                model=model_ppo,
+                model=model_sac,
                 test_data=validation,
-                test_env=val_env_ppo,
-                test_obs=val_obs_ppo,
+                test_env=val_env_sac,
+                test_obs=val_obs_sac,
             )
-            sharpe_ppo = self.get_validation_sharpe(i, model_name="PPO")
-            print("PPO Sharpe Ratio: ", sharpe_ppo)
+            sharpe_sac = self.get_validation_sharpe(i, model_name="SAC")
+            print("SAC Sharpe Ratio: ", sharpe_sac)
 
-            print("======DDPG Training========")
-            model_ddpg = self.get_model(
-                "ddpg",
+            print("======TD3 Training========")
+            model_td3 = self.get_model(
+                "td3",
                 self.train_env,
-                policy="MlpPolicy",
-                model_kwargs=DDPG_model_kwargs,
+                policy="MlpPolicy"
             )
-            model_ddpg = self.train_model(
-                model_ddpg,
-                "ddpg",
-                tb_log_name="ddpg_{}".format(i),
+            model_td3 = self.train_model(
+                model_td3,
+                "td3",
+                tb_log_name=f"td3_{i}",
                 iter_num=i,
-                total_timesteps=timesteps_dict["ddpg"],
+                total_timesteps=timesteps_dict["td3"],
             )  # 50_000
             print(
-                "======DDPG Validation from: ",
+                "======TD3 Validation from: ",
                 validation_start_date,
                 "to ",
                 validation_end_date,
             )
-            val_env_ddpg = DummyVecEnv(
+            val_env_td3 = DummyVecEnv(
                 [
                     lambda: StockTradingEnv(
-                        validation,
-                        self.stock_dim,
-                        self.hmax,
-                        self.initial_amount,
-                        self.buy_cost_pct,
-                        self.sell_cost_pct,
-                        self.reward_scaling,
-                        self.state_space,
-                        self.action_space,
-                        self.tech_indicator_list,
+                        df=validation,
+                        stock_dim=self.stock_dim,
+                        hmax=self.hmax,
+                        initial_amount=self.initial_amount,
+                        num_stock_shares=[0] * self.stock_dim,
+                        buy_cost_pct=[self.buy_cost_pct] * self.stock_dim,
+                        sell_cost_pct=[self.sell_cost_pct] * self.stock_dim,
+                        reward_scaling=self.reward_scaling,
+                        state_space=self.state_space,
+                        action_space=self.action_space,
+                        tech_indicator_list=self.tech_indicator_list,
                         turbulence_threshold=turbulence_threshold,
                         iteration=i,
-                        model_name="DDPG",
+                        model_name="TD3",
                         mode="validation",
                         print_verbosity=self.print_verbosity,
                     )
                 ]
             )
-            val_obs_ddpg = val_env_ddpg.reset()
+            val_obs_td3 = val_env_td3.reset()
             self.DRL_validation(
-                model=model_ddpg,
+                model=model_td3,
                 test_data=validation,
-                test_env=val_env_ddpg,
-                test_obs=val_obs_ddpg,
+                test_env=val_env_td3,
+                test_obs=val_obs_td3,
             )
-            sharpe_ddpg = self.get_validation_sharpe(i, model_name="DDPG")
+            sharpe_td3 = self.get_validation_sharpe(i, model_name="TD3")
 
-            ppo_sharpe_list.append(sharpe_ppo)
+            sac_sharpe_list.append(sharpe_sac)
             a2c_sharpe_list.append(sharpe_a2c)
-            ddpg_sharpe_list.append(sharpe_ddpg)
+            td3_sharpe_list.append(sharpe_td3)
 
             print(
                 "======Best Model Retraining from: ",
@@ -639,21 +637,21 @@ class DRLEnsembleAgent:
             #                                                    self.tech_indicator_list,
             #                                                    print_verbosity=self.print_verbosity)])
             # Model Selection based on sharpe ratio
-            if (sharpe_ppo >= sharpe_a2c) & (sharpe_ppo >= sharpe_ddpg):
-                model_use.append("PPO")
-                model_ensemble = model_ppo
+            if (sharpe_sac >= sharpe_a2c) & (sharpe_sac >= sharpe_td3):
+                model_use.append("SAC")
+                model_ensemble = model_sac
 
                 # model_ensemble = self.get_model("ppo",self.train_full_env,policy="MlpPolicy",model_kwargs=PPO_model_kwargs)
                 # model_ensemble = self.train_model(model_ensemble, "ensemble", tb_log_name="ensemble_{}".format(i), iter_num = i, total_timesteps=timesteps_dict['ppo']) #100_000
-            elif (sharpe_a2c > sharpe_ppo) & (sharpe_a2c > sharpe_ddpg):
+            elif (sharpe_a2c > sharpe_sac) & (sharpe_a2c > sharpe_td3):
                 model_use.append("A2C")
                 model_ensemble = model_a2c
 
                 # model_ensemble = self.get_model("a2c",self.train_full_env,policy="MlpPolicy",model_kwargs=A2C_model_kwargs)
                 # model_ensemble = self.train_model(model_ensemble, "ensemble", tb_log_name="ensemble_{}".format(i), iter_num = i, total_timesteps=timesteps_dict['a2c']) #100_000
             else:
-                model_use.append("DDPG")
-                model_ensemble = model_ddpg
+                model_use.append("TD3")
+                model_ensemble = model_td3
 
                 # model_ensemble = self.get_model("ddpg",self.train_full_env,policy="MlpPolicy",model_kwargs=DDPG_model_kwargs)
                 # model_ensemble = self.train_model(model_ensemble, "ensemble", tb_log_name="ensemble_{}".format(i), iter_num = i, total_timesteps=timesteps_dict['ddpg']) #50_000
@@ -688,8 +686,8 @@ class DRLEnsembleAgent:
                 validation_end_date_list,
                 model_use,
                 a2c_sharpe_list,
-                ppo_sharpe_list,
-                ddpg_sharpe_list,
+                sac_sharpe_list,
+                td3_sharpe_list,
             ]
         ).T
         df_summary.columns = [
